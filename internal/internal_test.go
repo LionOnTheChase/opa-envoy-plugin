@@ -19,9 +19,6 @@ import (
 	ext_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ext_authz_v2 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v2"
 	ext_authz "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
-	"github.com/prometheus/client_golang/prometheus"
-	"google.golang.org/genproto/googleapis/rpc/code"
-
 	"github.com/open-policy-agent/opa-envoy-plugin/envoyauth"
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/plugins"
@@ -29,7 +26,13 @@ import (
 	"github.com/open-policy-agent/opa/storage"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/topdown"
+	"github.com/open-policy-agent/opa/tracing"
 	"github.com/open-policy-agent/opa/util"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"google.golang.org/genproto/googleapis/rpc/code"
 )
 
 const exampleAllowedRequest = `{
@@ -165,38 +168,6 @@ func TestCheckAllow(t *testing.T) {
 	if output.Status.Code != int32(code.Code_OK) {
 		t.Fatal("Expected request to be allowed but got:", output)
 	}
-}
-
-func TestCheckTraceIDInAllowedRequest(t *testing.T) {
-	// Example Envoy Check Request for input:
-	// curl --user  bob:password  -o /dev/null -s -w "%{http_code}\n" http://${GATEWAY_URL}/api/v1/products
-
-	var req ext_authz.CheckRequest
-	if err := util.Unmarshal([]byte(exampleAllowedRequest), &req); err != nil {
-		panic(err)
-	}
-
-	customLogger := &testPlugin{}
-
-	server := testAuthzServer(nil, withCustomLogger(customLogger))
-	ctx := context.Background()
-	output, err := server.Check(ctx, &req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	event := customLogger.events[0]
-
-	if output.Status.Code != int32(code.Code_OK) {
-		t.Fatal("Expected request to be allowed but got:", output)
-	}
-
-	t.Log("Printing decision log event looking for traceid: ", event.TraceID)
-	t.Log("Printing decision log event looking for decisionid: ", event.DecisionID)
-
-	if event.TraceID == "" {
-		t.Fatal("Expected TraceID to be present but got empty")
-	}
-
 }
 
 func TestCheckTrigger(t *testing.T) {
@@ -1934,6 +1905,23 @@ func withCustomLogger(customLogger plugins.Plugin) customPluginFunc {
 	}
 }
 
+type factory struct{}
+
+func (*factory) NewTransport(tr http.RoundTripper, opts tracing.Options) http.RoundTripper {
+	return otelhttp.NewTransport(tr, convertOpts(opts)...)
+}
+
+func (*factory) NewHandler(f http.Handler, label string, opts tracing.Options) http.Handler {
+	return otelhttp.NewHandler(f, label, convertOpts(opts)...)
+}
+
+func convertOpts(opts tracing.Options) []otelhttp.Option {
+	otelOpts := make([]otelhttp.Option, 0, len(opts))
+	for _, opt := range opts {
+		otelOpts = append(otelOpts, opt.(otelhttp.Option))
+	}
+	return otelOpts
+}
 func getPluginManager(module string, customPluginFuncs ...customPluginFunc) (*plugins.Manager, error) {
 	ctx := context.Background()
 	store := inmem.New()
@@ -1942,7 +1930,10 @@ func getPluginManager(module string, customPluginFuncs ...customPluginFunc) (*pl
 	store.Commit(ctx, txn)
 
 	registry := prometheus.NewRegistry()
-	m, err := plugins.New([]byte{}, "test", store, plugins.WithPrometheusRegister(registry))
+	tracing.RegisterHTTPTracing(&factory{})
+	spanExp := tracetest.NewInMemoryExporter()
+	tr := plugins.WithTracerProvider(trace.NewTracerProvider(trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(spanExp))))
+	m, err := plugins.New([]byte{}, "test", store, plugins.WithPrometheusRegister(registry), tr)
 	if err != nil {
 		return nil, err
 	}
@@ -2040,3 +2031,141 @@ func (p *testPluginError) Log(_ context.Context, event logs.EventV1) error {
 	p.events = append(p.events, event)
 	return fmt.Errorf("Bad Logger Error")
 }
+
+func TestCheckTraceIDInAllowedRequest(t *testing.T) {
+	// Example Envoy Check Request for input:
+	// curl --user  bob:password  -o /dev/null -s -w "%{http_code}\n" http://${GATEWAY_URL}/api/v1/products
+
+	var req ext_authz.CheckRequest
+	if err := util.Unmarshal([]byte(exampleAllowedRequest), &req); err != nil {
+		panic(err)
+	}
+
+	customLogger := &testPlugin{}
+
+	server := testAuthzServer(nil, withCustomLogger(customLogger))
+	ctx := context.Background()
+	output, err := server.Check(ctx, &req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := customLogger.events[0]
+
+	if output.Status.Code != int32(code.Code_OK) {
+		t.Fatal("Expected request to be allowed but got:", output)
+	}
+
+	t.Log("Printing decision log event looking for traceid: ", event.TraceID)
+	t.Log("Printing decision log event looking for decisionid: ", event.DecisionID)
+
+	if event.TraceID == "" {
+		t.Fatal("Expected TraceID to be present but got empty")
+	}
+
+}
+
+/*func TestServerSpan(t *testing.T) {
+
+	t.Run("envoy.service.auth.v3.Authorization Check", func(t *testing.T) {
+		var req ext_authz.CheckRequest
+		if err := util.Unmarshal([]byte(exampleAllowedRequest), &req); err != nil {
+			t.Fatal(err)
+		}
+		conn, err := grpc.Dial("localhost:9191", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatalf("did not connect: %v", err)
+		}
+		client := ext_authz.NewAuthorizationClient(conn)
+		resp, err := client.Check(context.Background(), &req)
+		if err != nil {
+			t.Fatalf("error when send request %v", err)
+		}
+		if resp.Status.Code != int32(code.Code_OK) {
+			t.Fatal("Expected request to be allowed but got:", resp)
+		}
+		spans := spanExporter.GetSpans()
+		if got, expected := len(spans), 2; got != expected {
+			t.Fatalf("got %d span(s), expected %d", got, expected)
+		}
+
+		t.Log("internal_test Traceid for verfiication span 0", spans[0].SpanContext.TraceID())
+		t.Log("internal_test Traceid for verfiication span 1", spans[1].SpanContext.TraceID())
+
+		if !spans[0].SpanContext.IsValid() {
+			t.Fatalf("invalid span created: %#v", spans[0].SpanContext)
+		}
+		if !spans[1].SpanContext.IsValid() {
+			t.Fatalf("invalid span created: %#v", spans[1].SpanContext)
+		}
+		if got, expected := spans[1].SpanKind.String(), "server"; got != expected {
+			t.Fatalf("Expected span kind to be %q but got %q", expected, got)
+		}
+		if got, expected := spans[1].Name, "envoy.service.auth.v3.Authorization/Check"; got != expected {
+			t.Fatalf("Expected span name to be %q but got %q", expected, got)
+		}
+		if got, expected := spans[0].SpanKind.String(), "client"; got != expected {
+			t.Fatalf("Expected span kind to be %q but got %q", expected, got)
+		}
+		if got, expected := spans[0].Name, "HTTP GET"; got != expected {
+			t.Fatalf("Expected span name to be %q but got %q", expected, got)
+		}
+		parentSpanID := spans[1].SpanContext.SpanID()
+		if got, expected := spans[0].Parent.SpanID(), parentSpanID; got != expected {
+			t.Errorf("expected span to be child of %v, got parent %v", expected, got)
+		}
+	})
+}
+
+type factory struct{}
+
+func (*factory) NewTransport(tr http.RoundTripper, opts tracing.Options) http.RoundTripper {
+	return otelhttp.NewTransport(tr, convertOpts(opts)...)
+}
+
+func (*factory) NewHandler(f http.Handler, label string, opts tracing.Options) http.Handler {
+	return otelhttp.NewHandler(f, label, convertOpts(opts)...)
+}
+
+func convertOpts(opts tracing.Options) []otelhttp.Option {
+	otelOpts := make([]otelhttp.Option, 0, len(opts))
+	for _, opt := range opts {
+		otelOpts = append(otelOpts, opt.(otelhttp.Option))
+	}
+	return otelOpts
+}
+
+var spanExporter *tracetest.InMemoryExporter
+
+func TestMain(m *testing.M) {
+	tracing.RegisterHTTPTracing(&factory{})
+	spanExporter = tracetest.NewInMemoryExporter()
+	tracerProvider := trace.NewTracerProvider(trace.WithSpanProcessor(trace.NewSimpleSpanProcessor(spanExporter)))
+	count := 0
+	countMutex := sync.Mutex{}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		countMutex.Lock()
+		count = count + 1
+		countMutex.Unlock()
+		fmt.Fprintf(w, `{"count": %d}`, count)
+	}))
+	defer ts.Close()
+	moduleFmt := `
+	package envoy.authz
+	default allow = false
+	allow {
+		resp := http.send({"url": "%s", "method":"GET"})
+		resp.body.count == 1
+	}`
+	module := fmt.Sprintf(moduleFmt, ts.URL)
+	customLogger := &testPlugin{}
+
+	pluginsManager, err := TestAuthzServerWithWithOpts(module, "envoy/authz/allow", ":9191", plugins.WithTracerProvider(tracerProvider), plugins.Logger(customLogger))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if pluginsManager.TracerProvider() != tracerProvider {
+		log.Fatal("unacepted tracer provider")
+	}
+	os.Exit(m.Run())
+}*/
